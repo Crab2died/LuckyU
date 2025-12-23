@@ -2,6 +2,8 @@ import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'dart:math';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:path_provider/path_provider.dart';
+import 'dart:io';
 
 // Cache constants
 const String _CACHE_PREFIX = 'lottery_history_';
@@ -758,4 +760,630 @@ class LotteryServiceResult {
     this.latestResult,
     this.errorMessage,
   });
+}
+
+// ==================== Saved Tickets ====================
+
+/// 保存的彩票号码
+class SavedTicket {
+  final String id;
+  final LotteryType type;
+  final List<int> frontNumbers;
+  final List<int> backNumbers;
+  final DateTime savedAt;
+  final String? note;
+  final String? targetIssue; // 目标期号
+
+  SavedTicket({
+    required this.id,
+    required this.type,
+    required this.frontNumbers,
+    required this.backNumbers,
+    required this.savedAt,
+    this.note,
+    this.targetIssue,
+  });
+
+  Map<String, dynamic> toJson() {
+    return {
+      'id': id,
+      'type': type == LotteryType.SSQ ? 'SSQ' : 'DLT',
+      'frontNumbers': frontNumbers,
+      'backNumbers': backNumbers,
+      'savedAt': savedAt.toIso8601String(),
+      'note': note,
+      'targetIssue': targetIssue,
+    };
+  }
+
+  factory SavedTicket.fromJson(Map<String, dynamic> json) {
+    return SavedTicket(
+      id: json['id'] ?? '',
+      type: json['type'] == 'SSQ' ? LotteryType.SSQ : LotteryType.DLT,
+      frontNumbers: List<int>.from(json['frontNumbers'] ?? []),
+      backNumbers: List<int>.from(json['backNumbers'] ?? []),
+      savedAt: DateTime.tryParse(json['savedAt'] ?? '') ?? DateTime.now(),
+      note: json['note'],
+      targetIssue: json['targetIssue'],
+    );
+  }
+}
+
+/// 中奖结果
+class PrizeResult {
+  final bool isWinner;
+  final int? prizeLevel; // 1-9等奖，null表示未中奖
+  final String prizeName; // 奖项名称
+  final int frontMatch; // 前区匹配数量
+  final int backMatch; // 后区匹配数量
+  final bool foundResult; // 是否找到开奖结果
+  final String? issue; // 验证的期号
+
+  PrizeResult({
+    required this.isWinner,
+    this.prizeLevel,
+    required this.prizeName,
+    required this.frontMatch,
+    required this.backMatch,
+    this.foundResult = true,
+    this.issue,
+  });
+}
+
+/// 保存的彩票服务
+class SavedTicketService {
+  static const String _fileName = 'saved_tickets.json';
+  static File? _cachedFile;
+
+  /// 获取存储文件路径
+  static Future<File> _getStorageFile() async {
+    if (_cachedFile != null) {
+      return _cachedFile!;
+    }
+    
+    // 首先尝试使用 path_provider
+    try {
+      final directory = await getApplicationDocumentsDirectory();
+      final file = File('${directory.path}/$_fileName');
+      _cachedFile = file;
+      return file;
+    } catch (e) {
+      print('Get application documents directory error: $e');
+    }
+    
+    // 如果 path_provider 失败，尝试使用临时目录
+    try {
+      final directory = await getTemporaryDirectory();
+      final file = File('${directory.path}/$_fileName');
+      _cachedFile = file;
+      return file;
+    } catch (e) {
+      print('Get temporary directory error: $e');
+    }
+    
+    // 如果 path_provider 完全不可用，使用备用方案
+    try {
+      Directory storageDir;
+      if (Platform.isWindows) {
+        // Windows: 使用用户文档目录
+        final userProfile = Platform.environment['USERPROFILE'] ?? 
+                          Platform.environment['HOME'] ?? '';
+        if (userProfile.isNotEmpty) {
+          storageDir = Directory('$userProfile/Documents/LuckyU');
+        } else {
+          storageDir = Directory.current;
+        }
+      } else if (Platform.isMacOS || Platform.isLinux) {
+        // macOS/Linux: 使用用户主目录
+        final home = Platform.environment['HOME'] ?? '';
+        if (home.isNotEmpty) {
+          storageDir = Directory('$home/.local/share/LuckyU');
+        } else {
+          storageDir = Directory.current;
+        }
+      } else if (Platform.isAndroid || Platform.isIOS) {
+        // 移动平台：使用应用目录
+        storageDir = Directory.current;
+      } else {
+        // 其他平台：使用当前目录
+        storageDir = Directory.current;
+      }
+      
+      // 确保目录存在
+      if (!await storageDir.exists()) {
+        await storageDir.create(recursive: true);
+      }
+      
+      final file = File('${storageDir.path}/$_fileName');
+      _cachedFile = file;
+      print('Using fallback storage path: ${file.path}');
+      return file;
+    } catch (e) {
+      print('Get storage file error: $e');
+      // 最后的备用方案：使用当前工作目录
+      final file = File('$_fileName');
+      _cachedFile = file;
+      return file;
+    }
+  }
+
+  /// 从SharedPreferences迁移数据到文件（一次性迁移）
+  static Future<void> _migrateFromSharedPreferences() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final jsonString = prefs.getString('saved_tickets');
+      if (jsonString != null) {
+        // 检查文件是否已存在
+        final file = await _getStorageFile();
+        if (!await file.exists()) {
+          // 文件不存在，迁移数据
+          await file.writeAsString(jsonString);
+          print('Migrated tickets from SharedPreferences to file');
+        }
+        // 迁移成功后，可以选择删除SharedPreferences中的数据
+        // await prefs.remove('saved_tickets');
+      }
+    } catch (e) {
+      print('Migration error: $e');
+    }
+  }
+
+  /// 计算下一期期号
+  /// 期号格式可能是：YYYYMMDD-NN 或纯数字
+  static String? calculateNextIssue(String currentIssue, LotteryType type) {
+    if (currentIssue.isEmpty) return null;
+
+    // 尝试解析日期-序号格式 (如: 20251211-01)
+    final dashIndex = currentIssue.indexOf('-');
+    if (dashIndex > 0) {
+      final datePart = currentIssue.substring(0, dashIndex);
+      final seqPart = currentIssue.substring(dashIndex + 1);
+
+      // 尝试解析日期部分 (YYYYMMDD)
+      if (datePart.length == 8) {
+        final year = int.tryParse(datePart.substring(0, 4));
+        final month = int.tryParse(datePart.substring(4, 6));
+        final day = int.tryParse(datePart.substring(6, 8));
+        final seq = int.tryParse(seqPart);
+
+        if (year != null && month != null && day != null && seq != null) {
+          // 计算下一期日期
+          // 双色球：周二、四、日开奖
+          // 大乐透：周一、三、六开奖
+          DateTime nextDate;
+          if (type == LotteryType.SSQ) {
+            // 双色球：找到下一个周二、四或日
+            nextDate = DateTime(year, month, day);
+            while (true) {
+              nextDate = nextDate.add(const Duration(days: 1));
+              final weekday = nextDate.weekday;
+              if (weekday == 2 || weekday == 4 || weekday == 7) {
+                // 周二(2)、周四(4)、周日(7)
+                break;
+              }
+            }
+          } else {
+            // 大乐透：找到下一个周一、三或六
+            nextDate = DateTime(year, month, day);
+            while (true) {
+              nextDate = nextDate.add(const Duration(days: 1));
+              final weekday = nextDate.weekday;
+              if (weekday == 1 || weekday == 3 || weekday == 6) {
+                // 周一(1)、周三(3)、周六(6)
+                break;
+              }
+            }
+          }
+
+          // 格式化下一期期号
+          final nextYear = nextDate.year.toString();
+          final nextMonth = nextDate.month.toString().padLeft(2, '0');
+          final nextDay = nextDate.day.toString().padLeft(2, '0');
+          final nextSeq = (seq + 1).toString().padLeft(2, '0');
+          return '$nextYear$nextMonth$nextDay-$nextSeq';
+        }
+      }
+    }
+
+    // 尝试纯数字格式，简单递增
+    final numValue = int.tryParse(currentIssue);
+    if (numValue != null) {
+      return (numValue + 1).toString();
+    }
+
+    // 如果无法解析，返回null
+    return null;
+  }
+
+  /// 保存彩票号码
+  static Future<bool> saveTicket(SavedTicket ticket) async {
+    try {
+      // 首次使用时尝试迁移数据
+      await _migrateFromSharedPreferences();
+      
+      final tickets = await getAllTickets();
+      tickets.add(ticket);
+      final jsonList = tickets.map((t) => t.toJson()).toList();
+      final file = await _getStorageFile();
+      await file.writeAsString(jsonEncode(jsonList));
+      return true;
+    } catch (e) {
+      print('Save ticket error: $e');
+      return false;
+    }
+  }
+
+  /// 获取所有保存的彩票
+  static Future<List<SavedTicket>> getAllTickets() async {
+    try {
+      // 首次使用时尝试迁移数据
+      await _migrateFromSharedPreferences();
+      
+      final file = await _getStorageFile();
+      if (!await file.exists()) {
+        return [];
+      }
+      final jsonString = await file.readAsString();
+      if (jsonString.isEmpty) return [];
+      final jsonList = jsonDecode(jsonString) as List;
+      return jsonList.map((json) => SavedTicket.fromJson(json)).toList();
+    } catch (e) {
+      print('Get tickets error: $e');
+      return [];
+    }
+  }
+
+  /// 根据类型获取保存的彩票
+  static Future<List<SavedTicket>> getTicketsByType(LotteryType type) async {
+    final allTickets = await getAllTickets();
+    return allTickets.where((t) => t.type == type).toList();
+  }
+
+  /// 删除彩票
+  static Future<bool> deleteTicket(String id) async {
+    try {
+      // 首次使用时尝试迁移数据
+      await _migrateFromSharedPreferences();
+      
+      final tickets = await getAllTickets();
+      tickets.removeWhere((t) => t.id == id);
+      final jsonList = tickets.map((t) => t.toJson()).toList();
+      final file = await _getStorageFile();
+      await file.writeAsString(jsonEncode(jsonList));
+      return true;
+    } catch (e) {
+      print('Delete ticket error: $e');
+      return false;
+    }
+  }
+
+  /// 验证中奖（根据期号查找开奖结果）
+  static Future<PrizeResult> checkPrizeByIssue(SavedTicket ticket) async {
+    // 如果没有指定期号，返回未找到
+    if (ticket.targetIssue == null || ticket.targetIssue!.isEmpty) {
+      return PrizeResult(
+        isWinner: false,
+        prizeName: '未指定期号',
+        frontMatch: 0,
+        backMatch: 0,
+        foundResult: false,
+        issue: null,
+      );
+    }
+
+    // 获取历史数据，尝试找到对应期号
+    final historyCount = 500; // 获取足够多的历史数据
+    final result = await LotteryService.fetchHistoryData(
+      ticket.type,
+      historyCount,
+    );
+
+    if (!result.success || result.historyData.isEmpty) {
+      return PrizeResult(
+        isWinner: false,
+        prizeName: '无法获取开奖数据',
+        frontMatch: 0,
+        backMatch: 0,
+        foundResult: false,
+        issue: ticket.targetIssue,
+      );
+    }
+
+    // 获取最新期号
+    final latestIssue = result.latestResult?.issue;
+    if (latestIssue != null) {
+      // 比较期号：如果保存的期号大于最新期号，说明还未开奖
+      if (_compareIssue(ticket.targetIssue!, latestIssue) > 0) {
+        return PrizeResult(
+          isWinner: false,
+          prizeName: '未开奖',
+          frontMatch: 0,
+          backMatch: 0,
+          foundResult: false,
+          issue: ticket.targetIssue,
+        );
+      }
+    }
+
+    // 查找对应期号的开奖结果
+    final winningResult = result.historyData.firstWhere(
+      (r) => r.issue == ticket.targetIssue,
+      orElse: () => result.historyData.first, // 如果找不到，使用第一个作为占位
+    );
+
+    // 检查是否真的找到了对应期号
+    final foundExactMatch = winningResult.issue == ticket.targetIssue;
+
+    if (!foundExactMatch) {
+      return PrizeResult(
+        isWinner: false,
+        prizeName: '未找到期号 ${ticket.targetIssue} 的开奖结果',
+        frontMatch: 0,
+        backMatch: 0,
+        foundResult: false,
+        issue: ticket.targetIssue,
+      );
+    }
+
+    // 找到了，进行验证
+    return checkPrize(ticket, winningResult, ticket.targetIssue!);
+  }
+
+  /// 比较两个期号的大小
+  /// 返回: >0 表示 issue1 > issue2, <0 表示 issue1 < issue2, 0 表示相等
+  static int _compareIssue(String issue1, String issue2) {
+    // 尝试解析日期-序号格式 (如: 20251211-01)
+    final dashIndex1 = issue1.indexOf('-');
+    final dashIndex2 = issue2.indexOf('-');
+
+    if (dashIndex1 > 0 && dashIndex2 > 0) {
+      final datePart1 = issue1.substring(0, dashIndex1);
+      final seqPart1 = issue1.substring(dashIndex1 + 1);
+      final datePart2 = issue2.substring(0, dashIndex2);
+      final seqPart2 = issue2.substring(dashIndex2 + 1);
+
+      // 先比较日期部分
+      final dateCompare = datePart1.compareTo(datePart2);
+      if (dateCompare != 0) {
+        return dateCompare;
+      }
+
+      // 日期相同，比较序号
+      final seq1 = int.tryParse(seqPart1) ?? 0;
+      final seq2 = int.tryParse(seqPart2) ?? 0;
+      return seq1.compareTo(seq2);
+    }
+
+    // 尝试纯数字格式
+    final num1 = int.tryParse(issue1);
+    final num2 = int.tryParse(issue2);
+    if (num1 != null && num2 != null) {
+      return num1.compareTo(num2);
+    }
+
+    // 无法解析，使用字符串比较
+    return issue1.compareTo(issue2);
+  }
+
+  /// 验证中奖
+  static PrizeResult checkPrize(
+    SavedTicket ticket,
+    LotteryResult winningResult,
+    String issue,
+  ) {
+    // 通过前区数量判断类型：双色球6个，大乐透5个
+    final resultType = winningResult.front.length == 6
+        ? LotteryType.SSQ
+        : LotteryType.DLT;
+
+    if (ticket.type != resultType) {
+      // 类型不匹配，无法验证
+      return PrizeResult(
+        isWinner: false,
+        prizeName: '类型不匹配',
+        frontMatch: 0,
+        backMatch: 0,
+        foundResult: true,
+        issue: issue,
+      );
+    }
+
+    // 计算匹配数量
+    final frontMatch = ticket.frontNumbers
+        .where((n) => winningResult.front.contains(n))
+        .length;
+    final backMatch = ticket.backNumbers
+        .where((n) => winningResult.back.contains(n))
+        .length;
+
+    PrizeResult prizeResult;
+    if (ticket.type == LotteryType.SSQ) {
+      prizeResult = _checkSSQPrize(frontMatch, backMatch);
+    } else {
+      prizeResult = _checkDLTPrize(frontMatch, backMatch);
+    }
+
+    // 设置期号
+    return PrizeResult(
+      isWinner: prizeResult.isWinner,
+      prizeLevel: prizeResult.prizeLevel,
+      prizeName: prizeResult.prizeName,
+      frontMatch: prizeResult.frontMatch,
+      backMatch: prizeResult.backMatch,
+      foundResult: true,
+      issue: issue,
+    );
+  }
+
+  /// 验证双色球中奖
+  static PrizeResult _checkSSQPrize(int frontMatch, int backMatch) {
+    // 双色球规则：
+    // 一等奖：6红+1蓝
+    // 二等奖：6红
+    // 三等奖：5红+1蓝
+    // 四等奖：5红 或 4红+1蓝
+    // 五等奖：4红 或 3红+1蓝
+    // 六等奖：2红+1蓝 或 1红+1蓝 或 0红+1蓝 或 1蓝
+
+    if (frontMatch == 6 && backMatch == 1) {
+      return PrizeResult(
+        isWinner: true,
+        prizeLevel: 1,
+        prizeName: '一等奖',
+        frontMatch: frontMatch,
+        backMatch: backMatch,
+      );
+    } else if (frontMatch == 6 && backMatch == 0) {
+      return PrizeResult(
+        isWinner: true,
+        prizeLevel: 2,
+        prizeName: '二等奖',
+        frontMatch: frontMatch,
+        backMatch: backMatch,
+      );
+    } else if (frontMatch == 5 && backMatch == 1) {
+      return PrizeResult(
+        isWinner: true,
+        prizeLevel: 3,
+        prizeName: '三等奖',
+        frontMatch: frontMatch,
+        backMatch: backMatch,
+      );
+    } else if ((frontMatch == 5 && backMatch == 0) ||
+        (frontMatch == 4 && backMatch == 1)) {
+      return PrizeResult(
+        isWinner: true,
+        prizeLevel: 4,
+        prizeName: '四等奖',
+        frontMatch: frontMatch,
+        backMatch: backMatch,
+      );
+    } else if ((frontMatch == 4 && backMatch == 0) ||
+        (frontMatch == 3 && backMatch == 1)) {
+      return PrizeResult(
+        isWinner: true,
+        prizeLevel: 5,
+        prizeName: '五等奖',
+        frontMatch: frontMatch,
+        backMatch: backMatch,
+      );
+    } else if (backMatch == 1 ||
+        (frontMatch == 2 && backMatch == 1) ||
+        (frontMatch == 1 && backMatch == 1) ||
+        (frontMatch == 0 && backMatch == 1)) {
+      return PrizeResult(
+        isWinner: true,
+        prizeLevel: 6,
+        prizeName: '六等奖',
+        frontMatch: frontMatch,
+        backMatch: backMatch,
+      );
+    } else {
+      return PrizeResult(
+        isWinner: false,
+        prizeName: '未中奖',
+        frontMatch: frontMatch,
+        backMatch: backMatch,
+      );
+    }
+  }
+
+  /// 验证大乐透中奖
+  static PrizeResult _checkDLTPrize(int frontMatch, int backMatch) {
+    // 大乐透规则：
+    // 一等奖：5前+2后
+    // 二等奖：5前+1后
+    // 三等奖：5前
+    // 四等奖：4前+2后
+    // 五等奖：4前+1后
+    // 六等奖：3前+2后
+    // 七等奖：4前
+    // 八等奖：3前+1后 或 2前+2后
+    // 九等奖：3前 或 1前+2后 或 2前+1后 或 0前+2后
+
+    if (frontMatch == 5 && backMatch == 2) {
+      return PrizeResult(
+        isWinner: true,
+        prizeLevel: 1,
+        prizeName: '一等奖',
+        frontMatch: frontMatch,
+        backMatch: backMatch,
+      );
+    } else if (frontMatch == 5 && backMatch == 1) {
+      return PrizeResult(
+        isWinner: true,
+        prizeLevel: 2,
+        prizeName: '二等奖',
+        frontMatch: frontMatch,
+        backMatch: backMatch,
+      );
+    } else if (frontMatch == 5 && backMatch == 0) {
+      return PrizeResult(
+        isWinner: true,
+        prizeLevel: 3,
+        prizeName: '三等奖',
+        frontMatch: frontMatch,
+        backMatch: backMatch,
+      );
+    } else if (frontMatch == 4 && backMatch == 2) {
+      return PrizeResult(
+        isWinner: true,
+        prizeLevel: 4,
+        prizeName: '四等奖',
+        frontMatch: frontMatch,
+        backMatch: backMatch,
+      );
+    } else if (frontMatch == 4 && backMatch == 1) {
+      return PrizeResult(
+        isWinner: true,
+        prizeLevel: 5,
+        prizeName: '五等奖',
+        frontMatch: frontMatch,
+        backMatch: backMatch,
+      );
+    } else if (frontMatch == 3 && backMatch == 2) {
+      return PrizeResult(
+        isWinner: true,
+        prizeLevel: 6,
+        prizeName: '六等奖',
+        frontMatch: frontMatch,
+        backMatch: backMatch,
+      );
+    } else if (frontMatch == 4 && backMatch == 0) {
+      return PrizeResult(
+        isWinner: true,
+        prizeLevel: 7,
+        prizeName: '七等奖',
+        frontMatch: frontMatch,
+        backMatch: backMatch,
+      );
+    } else if ((frontMatch == 3 && backMatch == 1) ||
+        (frontMatch == 2 && backMatch == 2)) {
+      return PrizeResult(
+        isWinner: true,
+        prizeLevel: 8,
+        prizeName: '八等奖',
+        frontMatch: frontMatch,
+        backMatch: backMatch,
+      );
+    } else if ((frontMatch == 3 && backMatch == 0) ||
+        (frontMatch == 1 && backMatch == 2) ||
+        (frontMatch == 2 && backMatch == 1) ||
+        (frontMatch == 0 && backMatch == 2)) {
+      return PrizeResult(
+        isWinner: true,
+        prizeLevel: 9,
+        prizeName: '九等奖',
+        frontMatch: frontMatch,
+        backMatch: backMatch,
+      );
+    } else {
+      return PrizeResult(
+        isWinner: false,
+        prizeName: '未中奖',
+        frontMatch: frontMatch,
+        backMatch: backMatch,
+      );
+    }
+  }
 }
