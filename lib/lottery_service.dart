@@ -3,7 +3,9 @@ import 'dart:convert';
 import 'dart:math';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'dart:io';
+import 'database.dart';
 
 // Cache constants
 const String _CACHE_PREFIX = 'lottery_history_';
@@ -830,101 +832,106 @@ class PrizeResult {
   });
 }
 
-/// 保存的彩票服务
+/// 保存的彩票服务 (使用 Drift 数据库)
 class SavedTicketService {
-  static const String _fileName = 'saved_tickets.json';
-  static File? _cachedFile;
+  static const String _legacyFileName = 'saved_tickets.json';
+  static const String _migrationKey = 'drift_migration_completed';
+  static AppDatabase? _database;
+  static bool _migrationChecked = false;
 
-  /// 获取存储文件路径
-  static Future<File> _getStorageFile() async {
-    if (_cachedFile != null) {
-      return _cachedFile!;
-    }
-    
-    // 首先尝试使用 path_provider
+  /// 获取数据库实例
+  static AppDatabase get database {
+    _database ??= AppDatabase();
+    return _database!;
+  }
+
+  /// 初始化数据库并执行迁移
+  static Future<void> initialize() async {
+    await _migrateFromLegacyStorage();
+  }
+
+  /// 从旧存储迁移数据到 Drift (一次性迁移)
+  static Future<void> _migrateFromLegacyStorage() async {
+    if (_migrationChecked) return;
+    _migrationChecked = true;
+
     try {
-      final directory = await getApplicationDocumentsDirectory();
-      final file = File('${directory.path}/$_fileName');
-      _cachedFile = file;
-      return file;
-    } catch (e) {
-      print('Get application documents directory error: $e');
-    }
-    
-    // 如果 path_provider 失败，尝试使用临时目录
-    try {
-      final directory = await getTemporaryDirectory();
-      final file = File('${directory.path}/$_fileName');
-      _cachedFile = file;
-      return file;
-    } catch (e) {
-      print('Get temporary directory error: $e');
-    }
-    
-    // 如果 path_provider 完全不可用，使用备用方案
-    try {
-      Directory storageDir;
-      if (Platform.isWindows) {
-        // Windows: 使用用户文档目录
-        final userProfile = Platform.environment['USERPROFILE'] ?? 
-                          Platform.environment['HOME'] ?? '';
-        if (userProfile.isNotEmpty) {
-          storageDir = Directory('$userProfile/Documents/LuckyU');
-        } else {
-          storageDir = Directory.current;
-        }
-      } else if (Platform.isMacOS || Platform.isLinux) {
-        // macOS/Linux: 使用用户主目录
-        final home = Platform.environment['HOME'] ?? '';
-        if (home.isNotEmpty) {
-          storageDir = Directory('$home/.local/share/LuckyU');
-        } else {
-          storageDir = Directory.current;
-        }
-      } else if (Platform.isAndroid || Platform.isIOS) {
-        // 移动平台：使用应用目录
-        storageDir = Directory.current;
-      } else {
-        // 其他平台：使用当前目录
-        storageDir = Directory.current;
-      }
+      final prefs = await SharedPreferences.getInstance();
+      final migrationCompleted = prefs.getBool(_migrationKey) ?? false;
       
-      // 确保目录存在
-      if (!await storageDir.exists()) {
-        await storageDir.create(recursive: true);
+      if (migrationCompleted) {
+        return; // 已经迁移过了
       }
+
+      // 收集所有旧数据
+      final oldTickets = <SavedTicket>[];
+
+      // 1. 从 SharedPreferences 获取数据
+      final jsonStringFromPrefs = prefs.getString('saved_tickets');
+      if (jsonStringFromPrefs != null && jsonStringFromPrefs.isNotEmpty) {
+        try {
+          final jsonList = jsonDecode(jsonStringFromPrefs) as List;
+          oldTickets.addAll(
+            jsonList.map((json) => SavedTicket.fromJson(json)).toList(),
+          );
+        } catch (e) {
+          // 解析失败时忽略
+        }
+      }
+
+      // 2. 从文件获取数据 (非 Web 平台)
+      if (!kIsWeb) {
+        try {
+          final file = await _getLegacyStorageFile();
+          if (file != null && await file.exists()) {
+            final jsonString = await file.readAsString();
+            if (jsonString.isNotEmpty) {
+              final jsonList = jsonDecode(jsonString) as List;
+              final fileTickets = jsonList
+                  .map((json) => SavedTicket.fromJson(json))
+                  .toList();
+              
+              // 合并，避免重复
+              for (final ticket in fileTickets) {
+                if (!oldTickets.any((t) => t.id == ticket.id)) {
+                  oldTickets.add(ticket);
+                }
+              }
+            }
+          }
+        } catch (e) {
+          // 文件读取失败时忽略
+        }
+      }
+
+      // 3. 迁移到 Drift 数据库
+      if (oldTickets.isNotEmpty) {
+        await database.saveTickets(oldTickets);
+      }
+
+      // 4. 标记迁移完成
+      await prefs.setBool(_migrationKey, true);
       
-      final file = File('${storageDir.path}/$_fileName');
-      _cachedFile = file;
-      print('Using fallback storage path: ${file.path}');
-      return file;
     } catch (e) {
-      print('Get storage file error: $e');
-      // 最后的备用方案：使用当前工作目录
-      final file = File('$_fileName');
-      _cachedFile = file;
-      return file;
+      // 迁移失败时不阻塞应用，下次启动时重试
     }
   }
 
-  /// 从SharedPreferences迁移数据到文件（一次性迁移）
-  static Future<void> _migrateFromSharedPreferences() async {
+  /// 获取旧存储文件路径 (用于迁移)
+  static Future<File?> _getLegacyStorageFile() async {
+    if (kIsWeb) return null;
+    
     try {
-      final prefs = await SharedPreferences.getInstance();
-      final jsonString = prefs.getString('saved_tickets');
-      if (jsonString != null) {
-        // 检查文件是否已存在
-        final file = await _getStorageFile();
-        if (!await file.exists()) {
-          // 文件不存在，迁移数据
-          await file.writeAsString(jsonString);
-          print('Migrated tickets from SharedPreferences to file');
-        }
-        // 迁移成功后，可以选择删除SharedPreferences中的数据
-        // await prefs.remove('saved_tickets');
-      }
+      final directory = await getApplicationDocumentsDirectory();
+      return File('${directory.path}/$_legacyFileName');
     } catch (e) {
-      print('Migration error: $e');
+      // 尝试备用路径
+      try {
+        final directory = await getTemporaryDirectory();
+        return File('${directory.path}/$_legacyFileName');
+      } catch (e) {
+        return null;
+      }
     }
   }
 
@@ -998,17 +1005,10 @@ class SavedTicketService {
   /// 保存彩票号码
   static Future<bool> saveTicket(SavedTicket ticket) async {
     try {
-      // 首次使用时尝试迁移数据
-      await _migrateFromSharedPreferences();
-      
-      final tickets = await getAllTickets();
-      tickets.add(ticket);
-      final jsonList = tickets.map((t) => t.toJson()).toList();
-      final file = await _getStorageFile();
-      await file.writeAsString(jsonEncode(jsonList));
+      await _migrateFromLegacyStorage();
+      await database.saveTicket(ticket);
       return true;
     } catch (e) {
-      print('Save ticket error: $e');
       return false;
     }
   }
@@ -1016,45 +1016,38 @@ class SavedTicketService {
   /// 获取所有保存的彩票
   static Future<List<SavedTicket>> getAllTickets() async {
     try {
-      // 首次使用时尝试迁移数据
-      await _migrateFromSharedPreferences();
-      
-      final file = await _getStorageFile();
-      if (!await file.exists()) {
-        return [];
-      }
-      final jsonString = await file.readAsString();
-      if (jsonString.isEmpty) return [];
-      final jsonList = jsonDecode(jsonString) as List;
-      return jsonList.map((json) => SavedTicket.fromJson(json)).toList();
+      await _migrateFromLegacyStorage();
+      return await database.getAllTickets();
     } catch (e) {
-      print('Get tickets error: $e');
       return [];
     }
   }
 
   /// 根据类型获取保存的彩票
   static Future<List<SavedTicket>> getTicketsByType(LotteryType type) async {
-    final allTickets = await getAllTickets();
-    return allTickets.where((t) => t.type == type).toList();
+    await _migrateFromLegacyStorage();
+    return await database.getTicketsByType(type);
   }
 
   /// 删除彩票
   static Future<bool> deleteTicket(String id) async {
     try {
-      // 首次使用时尝试迁移数据
-      await _migrateFromSharedPreferences();
-      
-      final tickets = await getAllTickets();
-      tickets.removeWhere((t) => t.id == id);
-      final jsonList = tickets.map((t) => t.toJson()).toList();
-      final file = await _getStorageFile();
-      await file.writeAsString(jsonEncode(jsonList));
+      await _migrateFromLegacyStorage();
+      await database.deleteTicket(id);
       return true;
     } catch (e) {
-      print('Delete ticket error: $e');
       return false;
     }
+  }
+
+  /// 监听所有彩票变化 (响应式)
+  static Stream<List<SavedTicket>> watchAllTickets() {
+    return database.watchAllTickets();
+  }
+
+  /// 监听特定类型的彩票变化 (响应式)
+  static Stream<List<SavedTicket>> watchTicketsByType(LotteryType type) {
+    return database.watchTicketsByType(type);
   }
 
   /// 验证中奖（根据期号查找开奖结果）
