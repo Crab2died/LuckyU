@@ -608,12 +608,39 @@ class _LatestDrawViewState extends State<LatestDrawView> {
                         '第 $_currentPage / $totalPages 页',
                         style: const TextStyle(color: Colors.grey),
                       ),
+                    Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          TextButton(
+                            onPressed: _currentPage > 1
+                                ? () {
+                                    setState(() {
+                                      _currentPage = (_currentPage - 1).clamp(
+                                        1,
+                                        totalPages,
+                                      );
+                                    });
+                                  }
+                                : null,
+                            child: const Text('上一页'),
+                          ),
+                          TextButton(
+                            onPressed: _currentPage < totalPages
+                                ? () {
+                                    setState(() {
+                                      _currentPage = (_currentPage + 1).clamp(
+                                        1,
+                                        totalPages,
+                                      );
+                                    });
+                                  }
+                                : null,
+                            child: const Text('下一页'),
+                          ),
+                        ],
+                      ),
                       Row(
                         children: [
-                          const Text(
-                            '每页 ',
-                            style: TextStyle(color: Colors.grey, fontSize: 13),
-                          ),
                           DropdownButton<int>(
                             value: _pageSize,
                             isDense: true,
@@ -647,39 +674,6 @@ class _LatestDrawViewState extends State<LatestDrawView> {
                             },
                           ),
                         ],
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 8),
-                  // Navigation buttons
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      TextButton(
-                        onPressed: _currentPage > 1
-                            ? () {
-                                setState(() {
-                                  _currentPage = (_currentPage - 1).clamp(
-                                    1,
-                                    totalPages,
-                                  );
-                                });
-                              }
-                            : null,
-                        child: const Text('上一页'),
-                      ),
-                      TextButton(
-                        onPressed: _currentPage < totalPages
-                            ? () {
-                                setState(() {
-                                  _currentPage = (_currentPage + 1).clamp(
-                                    1,
-                                    totalPages,
-                                  );
-                                });
-                              }
-                            : null,
-                        child: const Text('下一页'),
                       ),
                     ],
                   ),
@@ -1427,12 +1421,40 @@ class _SavedTicketsViewState extends State<SavedTicketsView> {
                       '第 $_currentPage / $totalPages 页',
                       style: const TextStyle(color: Colors.grey),
                     ),
+                    // 导航按钮
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        TextButton(
+                          onPressed: _currentPage > 1
+                              ? () {
+                                  setState(() {
+                                    _currentPage = (_currentPage - 1).clamp(
+                                      1,
+                                      totalPages,
+                                    );
+                                  });
+                                }
+                              : null,
+                          child: const Text('上一页'),
+                        ),
+                        TextButton(
+                          onPressed: _currentPage < totalPages
+                              ? () {
+                                  setState(() {
+                                    _currentPage = (_currentPage + 1).clamp(
+                                      1,
+                                      totalPages,
+                                    );
+                                  });
+                                }
+                              : null,
+                          child: const Text('下一页'),
+                        ),
+                      ],
+                    ),
                     Row(
                       children: [
-                        const Text(
-                          '每页 ',
-                          style: TextStyle(color: Colors.grey, fontSize: 13),
-                        ),
                         DropdownButton<int>(
                           value: _pageSize,
                           isDense: true,
@@ -1466,39 +1488,6 @@ class _SavedTicketsViewState extends State<SavedTicketsView> {
                           },
                         ),
                       ],
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                // 导航按钮
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    TextButton(
-                      onPressed: _currentPage > 1
-                          ? () {
-                              setState(() {
-                                _currentPage = (_currentPage - 1).clamp(
-                                  1,
-                                  totalPages,
-                                );
-                              });
-                            }
-                          : null,
-                      child: const Text('上一页'),
-                    ),
-                    TextButton(
-                      onPressed: _currentPage < totalPages
-                          ? () {
-                              setState(() {
-                                _currentPage = (_currentPage + 1).clamp(
-                                  1,
-                                  totalPages,
-                                );
-                              });
-                            }
-                          : null,
-                      child: const Text('下一页'),
                     ),
                   ],
                 ),
