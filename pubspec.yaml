@@ -37,6 +37,11 @@ dependencies:
   http: ^1.1.0
   shared_preferences: ^2.2.2
   window_manager: ^0.4.3
+  path_provider: ^2.1.1
+  # Drift database (cross-platform SQLite)
+  drift: ^2.22.1
+  sqlite3_flutter_libs: ^0.5.28  # Native SQLite for mobile/desktop
+  drift_flutter: ^0.2.4  # Flutter integration including web support
 
 dev_dependencies:
   flutter_test:
@@ -49,6 +54,9 @@ dev_dependencies:
   # rules and activating additional ones.
   flutter_lints: ^6.0.0
   flutter_launcher_icons: ^0.14.4
+  # Drift code generation
+  drift_dev: ^2.22.1
+  build_runner: ^2.4.13
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
