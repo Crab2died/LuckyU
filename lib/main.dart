@@ -3,9 +3,13 @@ import 'package:flutter/foundation.dart' show kIsWeb;
 import 'dart:io' show Platform;
 import 'package:window_manager/window_manager.dart';
 import 'lottery.dart';
+import 'lottery_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // 初始化数据库并执行迁移
+  await SavedTicketService.initialize();
 
   // 在非移动端设置窗口大小限制
   if (!kIsWeb && (Platform.isWindows || Platform.isMacOS || Platform.isLinux)) {
